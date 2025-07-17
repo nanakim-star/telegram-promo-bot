@@ -1,0 +1,5 @@
+python-telegram-bot
+Flask[async]
+gunicorn
+APScheduler
+Pillow
