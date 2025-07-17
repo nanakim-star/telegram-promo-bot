@@ -16,7 +16,8 @@ from telegram.error import TelegramError
 # --- 기본 설정 ---
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 DATABASE_URL = os.getenv('DATABASE_URL')
-UPLOAD_FOLDER = os.getenv('RENDER_DISK_PATH', 'static/uploads') # Render Disk 경로 우선 사용
+# Render의 영구 디스크 경로를 환경 변수에서 가져오고, 없으면 로컬 폴더를 사용
+UPLOAD_FOLDER = os.getenv('RENDER_DISK_PATH', 'static/uploads')
 
 app = Flask(__name__)
 app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
@@ -51,38 +52,44 @@ def process_spintax(text):
 
 # --- 데이터베이스 초기화 ---
 def init_db():
+    # Render에서는 PostgreSQL 문법, 로컬에서는 SQLite 문법 사용
+    is_postgres = bool(DATABASE_URL)
+    
+    # 테이블 생성 SQL
+    config_table_sql = '''
+        CREATE TABLE IF NOT EXISTS config (
+            id INTEGER PRIMARY KEY, message TEXT, photo TEXT, 
+            interval_min INTEGER, interval_max INTEGER, scheduler_status TEXT,
+            preview_id TEXT
+        )'''
+    promo_rooms_table_sql = f'''
+        CREATE TABLE IF NOT EXISTS promo_rooms (
+            id {'SERIAL' if is_postgres else 'INTEGER'} PRIMARY KEY {'AUTOINCREMENT' if not is_postgres else ''},
+            chat_id TEXT NOT NULL UNIQUE,
+            room_name TEXT,
+            room_group TEXT DEFAULT '기본',
+            is_active INTEGER DEFAULT 1,
+            last_status TEXT DEFAULT '확인 안됨'
+        )'''
+    activity_log_table_sql = f'''
+        CREATE TABLE IF NOT EXISTS activity_log (
+            id {'SERIAL' if is_postgres else 'INTEGER'} PRIMARY KEY {'AUTOINCREMENT' if not is_postgres else ''},
+            timestamp {'TIMESTAMPTZ' if is_postgres else 'DATETIME'} DEFAULT CURRENT_TIMESTAMP,
+            details TEXT
+        )'''
+
     with get_db_connection() as conn:
         cursor = conn.cursor()
-        # 설정 테이블
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS config (
-                id INTEGER PRIMARY KEY, message TEXT, photo TEXT, 
-                interval_min INTEGER, interval_max INTEGER, scheduler_status TEXT,
-                preview_id TEXT
-            )
-        ''')
-        # 홍보방 테이블
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS promo_rooms (
-                id SERIAL PRIMARY KEY,
-                chat_id TEXT NOT NULL UNIQUE,
-                room_name TEXT,
-                room_group TEXT DEFAULT '기본',
-                is_active INTEGER DEFAULT 1,
-                last_status TEXT DEFAULT '확인 안됨'
-            )
-        ''')
-        # 활동 로그 테이블
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS activity_log (
-                id SERIAL PRIMARY KEY,
-                timestamp TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
-                details TEXT
-            )
-        ''')
+        cursor.execute(config_table_sql)
+        cursor.execute(promo_rooms_table_sql)
+        cursor.execute(activity_log_table_sql)
+        
         cursor.execute("SELECT * FROM config WHERE id = 1")
         if not cursor.fetchone():
-            cursor.execute("INSERT INTO config (id, message, photo, interval_min, interval_max, scheduler_status, preview_id) VALUES (1, '', '', 30, 40, 'running', '')")
+            cursor.execute(
+                "INSERT INTO config (id, message, photo, interval_min, interval_max, scheduler_status, preview_id) VALUES (%s, %s, %s, %s, %s, %s, %s)",
+                (1, '', '', 30, 40, 'running', '')
+            )
         conn.commit()
 
 # --- 텔레그램 봇 공통 로직 ---
@@ -116,16 +123,17 @@ async def scheduled_send():
         config_res = cursor.fetchone()
         
         cursor.execute("SELECT chat_id FROM promo_rooms WHERE is_active = 1")
-        active_rooms = cursor.fetchall()
-    
+        active_rooms_res = cursor.fetchall()
+        active_rooms = [row[0] for row in active_rooms_res]
+
     log_detail = ""
     try:
         if not config_res: raise ValueError("설정값이 DB에 없습니다.")
         message, photo = config_res[0], config_res[1]
         if not message or not active_rooms: raise ValueError("홍보 메시지 또는 대상 방이 설정되지 않았습니다.")
 
-        for room in active_rooms:
-            await send_message_logic(room[0], message, photo)
+        for room_id in active_rooms:
+            await send_message_logic(room_id, message, photo)
         
         log_detail = f"✅ {len(active_rooms)}개 활성 방에 메시지 발송 성공"
     except Exception as e:
@@ -140,121 +148,91 @@ async def scheduled_send():
 # --- 스케줄러 설정 ---
 scheduler = BackgroundScheduler(daemon=True, timezone='Asia/Seoul')
 
+# --- DB 헬퍼 함수 ---
+def query_db(query, args=(), one=False):
+    with get_db_connection() as conn:
+        # psycopg2와 sqlite3의 파라미터 스타일이 다르므로 변환
+        if DATABASE_URL:
+            query = query.replace('?', '%s')
+        
+        cursor = conn.cursor()
+        cursor.execute(query, args)
+        
+        if query.lower().strip().startswith(('insert', 'update', 'delete')):
+            conn.commit()
+            return
+
+        rv = [dict((cursor.description[idx][0], value) for idx, value in enumerate(row)) for row in cursor.fetchall()]
+        return (rv[0] if rv else None) if one else rv
+
+def execute_db(query, args=()):
+    with get_db_connection() as conn:
+        if DATABASE_URL:
+            query = query.replace('?', '%s')
+        cursor = conn.cursor()
+        cursor.execute(query, args)
+        conn.commit()
+
 # --- 관리자 페이지 및 API 라우트 ---
 @app.route('/', methods=['GET', 'POST'])
 def admin_page():
     page_message = None
-    with get_db_connection() as conn:
-        cursor = conn.cursor()
+    if request.method == 'POST':
+        message, preview_id = request.form.get('message'), request.form.get('preview_id')
+        interval_min = int(request.form.get('interval_min', 30))
+        interval_max = int(request.form.get('interval_max', 40))
+        photo = request.files.get('photo')
         
-        if request.method == 'POST':
-            # 메인 설정 저장
-            # ... (이하 모든 로직은 이전과 동일하나, DB 커서 사용법이 %s로 변경될 수 있음)
-            # 이 코드는 psycopg2와 sqlite3 모두에서 작동하도록 범용적으로 작성됨
-            pass
+        current_config = query_db("SELECT interval_min, interval_max, photo FROM config WHERE id = 1", one=True)
+        photo_filename = current_config['photo']
+
+        if photo and photo.filename:
+            os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
+            photo_filename = photo.filename
+            photo.save(os.path.join(app.config['UPLOAD_FOLDER'], photo_filename))
         
-        # --- 데이터 조회 ---
-        # ... (이하 모든 로직은 이전과 동일하나, DB 커서 사용법이 %s로 변경될 수 있음)
-        # 이 코드는 psycopg2와 sqlite3 모두에서 작동하도록 범용적으로 작성됨
+        execute_db(
+            "UPDATE config SET message=?, photo=?, interval_min=?, interval_max=?, preview_id=? WHERE id = 1",
+            (message, photo_filename, interval_min, interval_max, preview_id)
+        )
 
-        # 예시:
-        cursor.execute("SELECT * FROM config WHERE id = 1")
-        config_res = cursor.fetchone()
-        # ...
-
-    # 가독성을 위해 이전 단계의 전체 코드를 여기에 다시 붙여넣기 보다는
-    # get_db_connection()과 SQL 쿼리 문법만 확인하도록 안내하는 것이 좋습니다.
-    # 하지만 사용자의 요청에 따라 전체 코드를 제공합니다.
-
-    # 임시로 이전 단계의 전체 코드를 여기에 붙여넣습니다.
-    # 실제 운영 시에는 SQL 문법을 DB에 맞게 조정해야 할 수 있습니다.
-
-    with get_db_connection() as conn:
-        # psycopg2는 기본적으로 딕셔너리 커서를 제공하지 않으므로, 인덱스로 접근
-        cursor = conn.cursor()
+        if interval_min != current_config['interval_min'] or interval_max != current_config['interval_max']:
+            next_run_minutes = random.randint(interval_min, interval_max)
+            scheduler.reschedule_job('promo_job', trigger='interval', minutes=next_run_minutes)
+            print(f"스케줄러 간격 변경. 다음 실행은 약 {next_run_minutes}분 후.")
         
-        if request.method == 'POST':
-            message, preview_id = request.form.get('message'), request.form.get('preview_id')
-            interval_min = int(request.form.get('interval_min', 30))
-            interval_max = int(request.form.get('interval_max', 40))
-            photo = request.files.get('photo')
-            
-            cursor.execute("SELECT interval_min, interval_max, photo FROM config WHERE id = 1")
-            res = cursor.fetchone()
-            current_interval_min, current_interval_max, current_photo = res[0], res[1], res[2]
+        page_message = "✅ 설정이 성공적으로 저장되었습니다."
 
-            photo_filename = current_photo
-            if photo and photo.filename:
-                # Ensure the uploads directory exists
-                os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
-                photo_filename = photo.filename
-                photo.save(os.path.join(app.config['UPLOAD_FOLDER'], photo_filename))
-            
-            cursor.execute(
-                "UPDATE config SET message=%s, photo=%s, interval_min=%s, interval_max=%s, preview_id=%s WHERE id = 1",
-                (message, photo_filename, interval_min, interval_max, preview_id)
-            )
-            conn.commit()
-
-            if interval_min != current_interval_min or interval_max != current_interval_max:
-                next_run_minutes = random.randint(interval_min, interval_max)
-                scheduler.reschedule_job('promo_job', trigger='interval', minutes=next_run_minutes)
-                print(f"스케줄러 간격이 {interval_min}-{interval_max}분으로 변경. 다음 실행은 약 {next_run_minutes}분 후.")
-            
-            page_message = "✅ 설정이 성공적으로 저장되었습니다."
-
-        # 대시보드 데이터 조회
-        # ... (이하 로직은 DB 종류에 따라 SQL 문법 조정 필요)
-        # 여기서는 psycopg2를 기준으로 작성
+    # 대시보드 데이터 조회
+    today = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=9))).strftime("%Y-%m-%d")
+    sent_today_query = "SELECT COUNT(*) as count FROM activity_log WHERE details LIKE '✅%%' AND DATE(timestamp, '+9 hours') = ?" if not DATABASE_URL else "SELECT COUNT(*) as count FROM activity_log WHERE details LIKE '✅%%' AND (timestamp AT TIME ZONE 'utc' AT TIME ZONE 'Asia/Seoul')::date = CURRENT_DATE"
+    sent_today = query_db(sent_today_query, (today,) if not DATABASE_URL else (), one=True)['count']
+    
+    log_query = "SELECT strftime('%Y-%m-%d %H:%M:%S', timestamp, '+9 hours') as ts, details FROM activity_log ORDER BY id DESC LIMIT 5" if not DATABASE_URL else "SELECT to_char(timestamp AT TIME ZONE 'Asia/Seoul', 'YYYY-MM-DD HH24:MI:SS') as ts, details FROM activity_log ORDER BY id DESC LIMIT 5"
+    recent_logs = query_db(log_query)
+    
+    promo_rooms = query_db("SELECT * FROM promo_rooms ORDER BY room_group, room_name")
+    config = query_db("SELECT * FROM config WHERE id = 1", one=True)
+    dashboard_data = {'sent_today': sent_today, 'recent_logs': recent_logs, 'room_count': len(promo_rooms)}
         
-        cursor.execute("SELECT COUNT(*) FROM activity_log WHERE details LIKE '✅%%' AND (timestamp AT TIME ZONE 'utc' AT TIME ZONE 'Asia/Seoul')::date = CURRENT_DATE")
-        sent_today = cursor.fetchone()[0]
-        
-        cursor.execute("SELECT to_char(timestamp AT TIME ZONE 'Asia/Seoul', 'YYYY-MM-DD HH24:MI:SS'), details FROM activity_log ORDER BY id DESC LIMIT 5")
-        recent_logs = [{'timestamp': row[0], 'details': row[1]} for row in cursor.fetchall()]
-        
-        cursor.execute("SELECT * FROM promo_rooms ORDER BY room_group, room_name")
-        promo_rooms_res = cursor.fetchall()
-        # 컬럼 이름과 매핑
-        cols = [desc[0] for desc in cursor.description]
-        promo_rooms = [dict(zip(cols, row)) for row in promo_rooms_res]
-
-        cursor.execute("SELECT * FROM config WHERE id = 1")
-        config_res = cursor.fetchone()
-        cols = [desc[0] for desc in cursor.description]
-        config = dict(zip(cols, config_res))
-        
-        dashboard_data = {'sent_today': sent_today, 'recent_logs': recent_logs, 'room_count': len(promo_rooms)}
-
     return render_template('admin.html', config=config, message=page_message, dashboard=dashboard_data, promo_rooms=promo_rooms, scheduler_state=scheduler.state)
 
-
-# --- API 라우트들 ---
-# (이하 /add_room, /delete_room 등 모든 API 라우트는
-# SQL 쿼리의 '?'를 '%s'로 바꾸는 것 외에는 대부분 동일하게 작동합니다.)
 
 @app.route('/add_room', methods=['POST'])
 def add_room():
     chat_id, room_name, room_group = request.form.get('chat_id'), request.form.get('room_name'), request.form.get('room_group')
     if not chat_id: return "Chat ID는 필수입니다.", 400
-    with get_db_connection() as conn:
-        cursor = conn.cursor()
-        try:
-            cursor.execute("INSERT INTO promo_rooms (chat_id, room_name, room_group) VALUES (%s, %s, %s)", (chat_id, room_name, room_group))
-            conn.commit()
-        except (psycopg2.IntegrityError, sqlite3.IntegrityError):
-            return "이미 존재하는 Chat ID 입니다.", 400
+    try:
+        execute_db("INSERT INTO promo_rooms (chat_id, room_name, room_group) VALUES (?, ?, ?)", (chat_id, room_name, room_group))
+    except (psycopg2.IntegrityError, sqlite3.IntegrityError):
+        return "이미 존재하는 Chat ID 입니다.", 400
     return "성공적으로 추가되었습니다."
 
-# ... 기타 API 라우트들도 위와 같이 수정 ...
-# (전체 코드를 제공하기 위해 아래에 모두 포함)
+# (이하 다른 API 라우트들도 execute_db, query_db 헬퍼 함수 사용)
 
 @app.route('/delete_room/<int:room_id>', methods=['POST'])
 def delete_room(room_id):
-    with get_db_connection() as conn:
-        cursor = conn.cursor()
-        cursor.execute("DELETE FROM promo_rooms WHERE id = %s", (room_id,))
-        conn.commit()
+    execute_db("DELETE FROM promo_rooms WHERE id = ?", (room_id,))
     return "삭제되었습니다."
 
 @app.route('/import_rooms', methods=['POST'])
@@ -265,24 +243,23 @@ def import_rooms():
     stream = io.StringIO(file.stream.read().decode("UTF8"), newline=None)
     reader = csv.reader(stream)
     next(reader, None) # 헤더 스킵
-    with get_db_connection() as conn:
-        cursor = conn.cursor()
-        for row in reader:
-            if len(row) >= 3:
-                cursor.execute("INSERT INTO promo_rooms (chat_id, room_name, room_group) VALUES (%s, %s, %s) ON CONFLICT (chat_id) DO NOTHING", (row[0], row[1], row[2]))
-        conn.commit()
+    for row in reader:
+        if len(row) >= 3:
+            # ON CONFLICT는 DB마다 문법이 약간 다를 수 있으므로, 여기서는 IGNORE 방식을 사용
+            try:
+                execute_db("INSERT INTO promo_rooms (chat_id, room_name, room_group) VALUES (?, ?, ?)", (row[0], row[1], row[2]))
+            except (psycopg2.IntegrityError, sqlite3.IntegrityError):
+                continue # 중복이면 무시
     return "가져오기 완료!"
 
 @app.route('/export_rooms')
 def export_rooms():
-    with get_db_connection() as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT chat_id, room_name, room_group FROM promo_rooms")
-        rows = cursor.fetchall()
+    rows = query_db("SELECT chat_id, room_name, room_group FROM promo_rooms")
     output = io.StringIO()
     writer = csv.writer(output)
     writer.writerow(['Chat ID', 'Room Name', 'Group'])
-    writer.writerows(rows)
+    for row in rows:
+        writer.writerow([row['chat_id'], row['room_name'], row['room_group']])
     return Response(output.getvalue(), mimetype="text/csv", headers={"Content-Disposition":"attachment;filename=rooms.csv"})
 
 @app.route('/toggle_scheduler/<string:action>', methods=['POST'])
@@ -293,37 +270,26 @@ def toggle_scheduler(action):
             scheduler.pause()
         elif action == 'resume' and scheduler.state == 2:
             scheduler.resume()
-        with get_db_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("UPDATE config SET scheduler_status = %s WHERE id = 1", (status_to_set,))
-            conn.commit()
+        execute_db("UPDATE config SET scheduler_status = ? WHERE id = 1", (status_to_set,))
         return f"스케줄러가 {status_to_set} 상태가 되었습니다."
     except Exception as e:
         return f"오류 발생: {e}", 500
 
 @app.route('/check_rooms', methods=['POST'])
 async def check_rooms():
-    with get_db_connection() as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT id, chat_id FROM promo_rooms")
-        rooms = cursor.fetchall()
-
+    rooms = query_db("SELECT id, chat_id FROM promo_rooms")
     bot = Bot(token=BOT_TOKEN)
     for room in rooms:
-        room_id_db, chat_id = room[0], room[1]
         status = ''
         try:
-            chat = await bot.get_chat(chat_id=chat_id)
+            chat = await bot.get_chat(chat_id=room['chat_id'])
             status = f"✅ OK ({chat.title})"
         except TelegramError as e:
             status = f"❌ Error: {e.message}"
         except Exception as e:
             status = f"❌ Error: {e}"
         
-        with get_db_connection() as conn_update:
-            cursor_update = conn_update.cursor()
-            cursor_update.execute("UPDATE promo_rooms SET last_status = %s WHERE id = %s", (status, room_id_db))
-            conn_update.commit()
+        execute_db("UPDATE promo_rooms SET last_status = ? WHERE id = ?", (status, room['id']))
             
     return "상태 확인 완료!"
 
@@ -332,47 +298,31 @@ async def preview_message():
     try:
         preview_id, message_template = request.form.get('preview_id'), request.form.get('message')
         photo = request.files.get('photo')
-        
-        if not preview_id or not message_template:
-            return jsonify({'message': '미리보기를 보낼 ID와 메시지를 입력해주세요.'}), 400
-
-        if not BOT_TOKEN:
-            return jsonify({'message': '오류: 봇 토큰이 설정되지 않았습니다.'}), 500
+        if not preview_id or not message_template: return jsonify({'message': 'ID와 메시지를 입력해주세요.'}), 400
 
         final_message = process_spintax(message_template)
-        
         if photo and photo.filename:
             photo.seek(0)
             await Bot(token=BOT_TOKEN).send_photo(chat_id=preview_id, photo=photo, caption=final_message)
         else:
             await Bot(token=BOT_TOKEN).send_message(chat_id=preview_id, text=final_message)
-
-        return jsonify({'message': f'✅ {preview_id}로 미리보기 메시지를 성공적으로 보냈습니다.'})
+        return jsonify({'message': f'✅ {preview_id}로 미리보기 발송 성공.'})
     except Exception as e:
         return jsonify({'message': f'❌ 미리보기 전송 실패: {e}'}), 500
 
 # --- 애플리케이션 실행 ---
-if __name__ == '__main__':
-    # 디스크 경로가 없으면 생성
-    if not os.path.exists(app.config['UPLOAD_FOLDER']):
-        os.makedirs(app.config['UPLOAD_FOLDER'])
+init_db()
 
-    init_db()
-    
-    with get_db_connection() as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT interval_min, interval_max FROM config WHERE id = 1")
-        res = cursor.fetchone()
-        interval_min = res[0] if res else 30
-        interval_max = res[1] if res else 40
+if __name__ == '__main__':
+    # 로컬 실행을 위한 스케줄러 및 서버 시작
+    config = query_db("SELECT interval_min, interval_max FROM config WHERE id = 1", one=True)
+    interval_min = config['interval_min'] if config else 30
+    interval_max = config['interval_max'] if config else 40
 
     scheduler.add_job(lambda: asyncio.run(scheduled_send()), 'interval', minutes=random.randint(interval_min, interval_max), id='promo_job')
     scheduler.start()
     
-    with get_db_connection() as conn:
-        cursor = conn.cursor()
-        cursor.execute("UPDATE config SET scheduler_status = %s WHERE id = 1", ('running',))
-        conn.commit()
+    execute_db("UPDATE config SET scheduler_status = ? WHERE id = 1", ('running',))
 
     print("데이터베이스와 스케줄러가 준비되었습니다.")
-    app.run(host='0.0.0.0', port=8080)
+    app.run(host='0.0.0.0', port=8080, debug=True)
